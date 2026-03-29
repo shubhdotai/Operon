@@ -13,8 +13,8 @@ Structure sent to the LLM (optimised for prompt caching):
 import sqlite3
 import time
 
-import agent.db as db_mod
-import agent.memory as mem
+import Operon.db as db_mod
+import Operon.memory as mem
 
 # How many recent runs to load as full transcripts vs. compress to summaries
 RUN_WINDOW_MIN = 3
@@ -36,6 +36,14 @@ All your capabilities are executed through the single run(command, stdin?) tool.
     cmd1 | cmd2    (pipe cmd1's output into cmd2's stdin)
 - **Self-discovery** — when unsure how a command works, run: help
 - **Error handling** — if a command errors, read the message, correct it, and retry.
+
+## Browser Work
+
+- Use `bb-browser` for all web work. In this environment that means `browser`, `fetch`, and `search` are all bb-browser-backed.
+- For search, use Google through bb-browser: `browser search <query>` or `search <query>`.
+- For website information extraction, prefer `browser site ...` adapters first. Manual `browser open` / `snapshot` / DOM interaction is the fallback when no adapter fits.
+- Use `browser fetch ...` or `fetch ...` for authenticated requests that need the real browser's cookies/login state.
+- If a skill named `bb-browser` is available, load it before non-trivial browser work.
 
 ## Message Structure
 

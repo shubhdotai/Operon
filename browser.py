@@ -1,345 +1,240 @@
 """
-browser.py — Web fetch, search, and browser automation commands.
+browser.py — bb-browser-backed web/search/browser commands.
 
 Three commands registered:
 
-  fetch <url>           Lightweight HTTP fetch — no JS, instant, no deps beyond stdlib.
-                        Falls back to urllib if httpx/bs4 not installed.
+  fetch <url>           Authenticated fetch via bb-browser in the real browser context.
 
-  search <query>        Web search via DuckDuckGo — no API key needed.
-                        Falls back to fetching DuckDuckGo HTML if duckduckgo_search missing.
+  search <query>        Web search via bb-browser site adapter `google/search`.
 
-  browser <action>      Full browser automation via Playwright (headless Chromium).
-                        Required: pip install playwright && playwright install chromium
+  browser <action>      Browser automation via bb-browser CLI (real Chrome with your login state).
+                        This is the default path for all browser and web-required work.
+                        Requires: npm install -g bb-browser
 
-Optional dependencies:
-  httpx              — better HTTP client (fallback: urllib.request)
-  beautifulsoup4     — HTML to text parsing (fallback: regex stripping)
-  duckduckgo-search  — structured search results (fallback: DuckDuckGo HTML)
-  playwright         — required for `browser` command only
+bb-browser actions:
+  open, snapshot, screenshot, click, hover, fill, type, check,
+  uncheck, select, wait, press, scroll, eval, get, tab, site,
+  fetch, network, console, errors, trace, frame, dialog,
+  history, status, back, forward, refresh, close
 """
 
 import re
+import subprocess
 import time
 from pathlib import Path
 
+URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+BB_BROWSER_DIR = Path.home() / ".bb-browser"
+BB_SITES_GIT_DIR = BB_BROWSER_DIR / "bb-sites" / ".git"
 
-# ── Lightweight HTTP fetch ────────────────────────────────────────────────────
+# ── bb-browser CLI wrapper ────────────────────────────────────────────────────
 
-def _fetch_url(url: str) -> str:
-    """Fetch a URL and return readable text. Falls back to urllib if httpx unavailable."""
-    try:
-        import httpx
-        resp = httpx.get(url, timeout=15, follow_redirects=True,
-                         headers={"User-Agent": "Mozilla/5.0 (compatible; agent/1.0)"})
-        resp.raise_for_status()
-        raw = resp.text
-    except ImportError:
-        import urllib.request
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            raw = r.read().decode("utf-8", errors="replace")
-
-    return _html_to_text(raw)
-
-
-def _html_to_text(html: str) -> str:
-    """Convert HTML to readable plain text."""
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-    except ImportError:
-        text = re.sub(r"<[^>]+>", " ", html)
-
-    # Collapse excessive blank lines
-    lines = [l.rstrip() for l in text.splitlines()]
-    result = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
-    return result.strip()
-
-
-# ── Web search ────────────────────────────────────────────────────────────────
-
-def _search_web(query: str, limit: int = 8) -> str:
+def _bb(*args: str, timeout: int = 60) -> str:
     """
-    Search via DuckDuckGo.
-    Primary: duckduckgo_search library (structured JSON results).
-    Fallback: DuckDuckGo Lite (plain HTML, no JS required, no bot protection).
+    Run a bb-browser CLI command and return stdout.
+    Raises RuntimeError on failure or if bb-browser is not installed.
     """
+    cmd = ["bb-browser"] + [str(a) for a in args]
     try:
-        from duckduckgo_search import DDGS
-        results = DDGS().text(query, max_results=limit)
-        if not results:
-            return "No results found."
-        lines = []
-        for r in results:
-            lines.append(f"**{r['title']}**")
-            lines.append(r["href"])
-            if r.get("body"):
-                lines.append(r["body"][:300])
-            lines.append("")
-        return "\n".join(lines).strip()
-    except ImportError:
-        pass
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "bb-browser is not installed.\n"
+            "Install it with:\n"
+            "  npm install -g bb-browser"
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"bb-browser command timed out after {timeout}s: {' '.join(cmd)}")
 
-    # Fallback: DuckDuckGo Lite — minimal HTML, no bot protection, no JS needed
-    import urllib.parse
-    encoded = urllib.parse.quote_plus(query)
-    url = f"https://lite.duckduckgo.com/lite/?q={encoded}"
-    try:
-        content = _fetch_url(url)
-        # Lite page has clean text; trim to keep context manageable
-        return content[:4000]
-    except Exception as e:
-        return f"Search unavailable: {e}\nInstall duckduckgo-search: pip install duckduckgo-search"
+    output = result.stdout.strip()
+    if result.returncode != 0:
+        err = result.stderr.strip() or output
+        raise RuntimeError(err)
+    return output
 
 
-# ── Playwright browser (stateful singleton) ───────────────────────────────────
+def _bb_timeout(action: str, rest: list[str]) -> int:
+    """Longer timeout for bb-browser commands that may open tabs or hit network."""
+    if action == "site" and rest[:1] == ["update"]:
+        return 180
+    if action in {"site", "fetch", "network", "history", "trace"}:
+        return 120
+    return 60
 
-class _BrowserManager:
+
+def _normalize_url(url: str) -> str:
+    """Add https:// when the caller passes a bare hostname."""
+    if not url:
+        return url
+    if URL_SCHEME_RE.match(url) or url.startswith(("//", "#", "/")):
+        return url
+    return "https://" + url
+
+
+def _ensure_site_adapters():
     """
-    Lazily initializes Playwright (headless Chromium) and keeps one page alive.
-    State persists across tool calls within a session — the LLM can open a page
-    in one tool call and screenshot it in the next.
-    Call browser.close() or `browser close` to tear down.
+    Install/update the community site adapter repo on first use so commands like
+    `site google/search` are available without manual setup.
     """
-
-    def __init__(self):
-        self._pw = None
-        self._browser = None
-        self._page = None
-
-    def _ensure(self):
-        if self._page and not self._page.is_closed():
-            return
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            raise RuntimeError(
-                "playwright is not installed.\n"
-                "Install it with:\n"
-                "  pip install playwright\n"
-                "  playwright install chromium"
-            )
-        if self._pw is None:
-            self._pw = sync_playwright().start()
-        if self._browser is None or not self._browser.is_connected():
-            self._browser = self._pw.chromium.launch(headless=True)
-        self._page = self._browser.new_page(
-            viewport={"width": 1280, "height": 800}
+    if BB_SITES_GIT_DIR.exists():
+        return
+    BB_BROWSER_DIR.mkdir(parents=True, exist_ok=True)
+    _bb("site", "update", timeout=180)
+    if not BB_SITES_GIT_DIR.exists():
+        raise RuntimeError(
+            "bb-browser site adapters are unavailable.\n"
+            "Tried: bb-browser site update"
         )
 
-    @property
-    def page(self):
-        self._ensure()
-        return self._page
 
-    def close(self):
-        if self._page and not self._page.is_closed():
-            self._page.close()
-            self._page = None
-        if self._browser:
-            self._browser.close()
-            self._browser = None
-        if self._pw:
-            self._pw.stop()
-            self._pw = None
+def _bb_site(*args: str, timeout: int = 120) -> str:
+    """Run a bb-browser site adapter, ensuring community adapters exist first."""
+    _ensure_site_adapters()
+    return _bb("site", *args, timeout=timeout)
 
 
-# Module-level singleton — persists browser across runs in the same Python process
-_browser = _BrowserManager()
-
-
-def _save_screenshot(page, data_dir: str, topic_id: str) -> str:
+def _save_screenshot(data_dir: str, topic_id: str) -> str:
     """
-    Take a full-page screenshot and save it to the agent's topic directory
-    (not work_dir — screenshots are agent-generated, not user project files).
+    Take a screenshot via bb-browser and save it to the agent's topic directory.
     Returns a file:// URL that loop.py detects and auto-attaches as vision content.
     """
     filename = f"screenshot-{int(time.time() * 1000)}.png"
     path = Path(data_dir) / "topics" / topic_id / filename
     path.parent.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(path), full_page=True)
+    _bb("screenshot", str(path))
     return f"Screenshot saved: {filename}\nView: ![screenshot](file://{path.resolve()})"
-
-
-def _normalize_selector(ref: str) -> str:
-    """Accept CSS selectors or plain text (wrapped in :has-text() for Playwright)."""
-    # If it looks like a CSS selector already, use it as-is
-    if re.search(r'[#.\[\]>~+:@]', ref):
-        return ref
-    # Otherwise treat as visible text
-    return f"text={ref}"
 
 
 # ── Command registration ──────────────────────────────────────────────────────
 
 def register_browser_commands(registry):
-    """Register `fetch`, `search`, and `browser` commands. Uses registry at call time."""
+    """Register `fetch`, `search`, and `browser` commands."""
 
     @registry.command(
         "fetch",
-        "Fetch a web page as text (no JS execution). Usage: fetch <url>\n"
-        "Faster than browser — use for static pages, docs, APIs.",
+        "Fetch through bb-browser in the real browser context. Usage: fetch <url>\n"
+        "Uses the browser's cookies/login state. For site-specific extraction, prefer `browser site ...`.",
     )
     def cmd_fetch(args, stdin=""):
         url = (" ".join(args) or stdin).strip()
         if not url:
             raise ValueError("usage: fetch <url>")
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        content = _fetch_url(url)
-        return content[:8000]  # cap at 8k chars to keep context manageable
+        return _bb("fetch", _normalize_url(url), timeout=120)
 
     @registry.command(
         "search",
-        "Search the web (DuckDuckGo, no API key). Usage: search <query>\n"
-        "Returns titles, URLs, and snippets for top results.",
+        "Search the web through bb-browser Google adapter. Usage: search <query>\n"
+        "Equivalent to: bb-browser site google/search <query>",
     )
     def cmd_search(args, stdin=""):
         query = (" ".join(args) or stdin).strip()
         if not query:
             raise ValueError("usage: search <query>")
-        return _search_web(query)
+        return _bb_site("google/search", query, timeout=120)
 
     @registry.command(
         "browser",
-        "Control a real browser (headless Chromium via Playwright).\n"
-        "  browser open <url>               — navigate to URL\n"
-        "  browser snapshot                 — get page text content\n"
-        "  browser screenshot               — take screenshot (auto-attaches as vision)\n"
-        "  browser click <selector|text>    — click element\n"
-        "  browser fill <selector> <text>   — clear and fill an input\n"
-        "  browser type <selector> <text>   — type into an element\n"
-        "  browser press <key>              — press key (Enter, Tab, Escape, ArrowDown...)\n"
-        "  browser scroll up|down [pixels]  — scroll page (default 300px)\n"
-        "  browser eval <script>            — evaluate JavaScript, returns result\n"
-        "  browser get url|title|text       — get page info or element text\n"
-        "  browser back|forward|refresh     — navigate history\n"
-        "  browser close                    — close browser session\n"
-        "Requires: pip install playwright && playwright install chromium",
+        "Control a real Chrome browser (with your login state) via bb-browser.\n"
+        "Use this for all web tasks. Prefer site adapters for search and structured extraction;\n"
+        "use manual page interaction only when no adapter fits.\n"
+        "  browser site <adapter> [args...]     — preferred: run a bb-browser site adapter\n"
+        "  browser search <query>               — alias for browser site google/search <query>\n"
+        "  browser open <url> [--tab ...]       — open a page when manual interaction is needed\n"
+        "  browser snapshot [-i]                — accessibility tree snapshot with @refs\n"
+        "  browser click|hover <ref>            — interact with an element\n"
+        "  browser fill|type <ref> <text>       — input text\n"
+        "  browser check|uncheck <ref>          — toggle a checkbox\n"
+        "  browser select <ref> <value>         — choose a select option\n"
+        "  browser wait <ms|@ref>               — wait for time or an element\n"
+        "  browser fetch <url> [options]        — fetch with browser cookies/login state\n"
+        "  browser network ...                  — inspect or mock network traffic\n"
+        "  browser console | errors | trace ... — browser debugging tools\n"
+        "  browser screenshot [path]            — take screenshot (auto-attaches if no path)\n"
+        "  browser get url|title|text [ref]     — get page info or element text\n"
+        "  browser eval <script>                — evaluate JavaScript\n"
+        "  browser tab ... | tabs | tab-new     — manage tabs\n"
+        "  browser frame ... | dialog ...       — advanced page handling\n"
+        "  browser back|forward|refresh|close   — navigate / close current tab\n"
+        "Snapshot refs: use @N (e.g. @3) from snapshot output to click/fill/get elements.\n"
+        "Requires: npm install -g bb-browser",
     )
     def cmd_browser(args, stdin=""):
         if not args:
             raise ValueError("usage: browser <action> [args...]")
 
         action = args[0]
-        rest   = args[1:]
-
-        # ── Navigation ────────────────────────────────────────────────────────
-
-        if action == "open":
-            url = (" ".join(rest) or stdin).strip()
-            if not url:
-                raise ValueError("usage: browser open <url>")
-            if not url.startswith(("http://", "https://")):
-                url = "https://" + url
-            page = _browser.page
-            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            return f"Opened: {page.title()}\nURL: {page.url}"
-
-        if action == "back":
-            _browser.page.go_back(wait_until="domcontentloaded")
-            return f"Back → {_browser.page.url}"
-
-        if action == "forward":
-            _browser.page.go_forward(wait_until="domcontentloaded")
-            return f"Forward → {_browser.page.url}"
-
-        if action == "refresh":
-            _browser.page.reload(wait_until="domcontentloaded")
-            return f"Refreshed: {_browser.page.url}"
-
-        # ── Content ───────────────────────────────────────────────────────────
-
-        if action == "snapshot":
-            page  = _browser.page
-            text  = page.evaluate("document.body.innerText")
-            return f"URL: {page.url}\nTitle: {page.title()}\n\n{text[:6000]}"
+        rest = args[1:]
+        timeout = _bb_timeout(action, rest)
 
         if action == "screenshot":
-            return _save_screenshot(_browser.page, registry.data_dir, registry.topic_id)
+            if rest:
+                return _bb("screenshot", *rest, timeout=timeout)
+            return _save_screenshot(registry.data_dir, registry.topic_id)
+
+        if action == "open":
+            if not rest and not stdin.strip():
+                raise ValueError("usage: browser open <url> [--tab ...]")
+            url = _normalize_url(rest[0] if rest else stdin.strip())
+            return _bb("open", url, *rest[1:], timeout=timeout)
+
+        if action == "search":
+            query = (" ".join(rest) or stdin).strip()
+            if not query:
+                raise ValueError("usage: browser search <query>")
+            return _bb_site("google/search", query, timeout=timeout)
+
+        if action == "site":
+            if not rest:
+                raise ValueError("usage: browser site <adapter|list|search|update|info> [...]")
+            if rest[:1] == ["update"]:
+                return _bb("site", *rest, timeout=timeout)
+            return _bb_site(*rest, timeout=timeout)
+
+        if action == "snapshot":
+            return _bb("snapshot", *rest, timeout=timeout)
 
         if action == "get":
-            attr = rest[0] if rest else "text"
-            page = _browser.page
-            if attr == "url":
-                return page.url
-            if attr == "title":
-                return page.title()
-            if attr == "text":
-                if len(rest) > 1:
-                    sel = _normalize_selector(" ".join(rest[1:]))
-                    return page.locator(sel).first.inner_text(timeout=5_000)
-                return page.evaluate("document.body.innerText")[:5000]
-            raise ValueError(f"unknown attribute '{attr}' — use: url|title|text")
-
-        # ── Interaction ───────────────────────────────────────────────────────
-
-        if action == "click":
+            if not rest and not stdin.strip():
+                raise ValueError("usage: browser get url|title|text [ref]")
             if not rest:
-                raise ValueError("usage: browser click <selector>")
-            sel  = _normalize_selector(" ".join(rest))
-            page = _browser.page
-            try:
-                page.locator(sel).first.click(timeout=5_000)
-            except Exception:
-                # Try clicking by visible text as fallback
-                page.get_by_text(" ".join(rest), exact=False).first.click(timeout=5_000)
-            return f"Clicked: {' '.join(rest)}"
+                return _bb("get", stdin.strip(), timeout=timeout)
+            return _bb("get", *rest, timeout=timeout)
 
-        if action == "fill":
-            if len(rest) < 2:
-                raise ValueError("usage: browser fill <selector> <text>")
-            sel  = _normalize_selector(rest[0])
-            text = " ".join(rest[1:]) or stdin
-            _browser.page.fill(sel, text, timeout=5_000)
-            return f"Filled '{rest[0]}'"
+        if action == "fill" and len(rest) == 1 and stdin.strip():
+            return _bb("fill", rest[0], stdin, timeout=timeout)
 
-        if action == "type":
-            if len(rest) < 2:
-                raise ValueError("usage: browser type <selector> <text>")
-            sel  = _normalize_selector(rest[0])
-            text = " ".join(rest[1:]) or stdin
-            _browser.page.locator(sel).type(text, delay=30)
-            return f"Typed into '{rest[0]}'"
+        if action == "type" and len(rest) == 1 and stdin.strip():
+            return _bb("type", rest[0], stdin, timeout=timeout)
 
-        if action == "press":
-            if not rest:
-                raise ValueError("usage: browser press <key>")
-            _browser.page.keyboard.press(rest[0])
-            return f"Pressed: {rest[0]}"
+        if action == "select" and len(rest) == 1 and stdin.strip():
+            return _bb("select", rest[0], stdin, timeout=timeout)
 
-        if action == "scroll":
-            direction = rest[0] if rest else "down"
-            pixels    = int(rest[1]) if len(rest) > 1 else 300
-            page      = _browser.page
-            if direction == "down":
-                page.evaluate(f"window.scrollBy(0, {pixels})")
-            elif direction == "up":
-                page.evaluate(f"window.scrollBy(0, -{pixels})")
-            elif direction == "right":
-                page.evaluate(f"window.scrollBy({pixels}, 0)")
-            elif direction == "left":
-                page.evaluate(f"window.scrollBy(-{pixels}, 0)")
-            else:
-                raise ValueError(f"unknown direction '{direction}' — use: up|down|left|right")
-            return f"Scrolled {direction} {pixels}px"
-
-        if action == "eval":
-            script = " ".join(rest) or stdin
+        if action == "eval" and not rest:
+            script = stdin.strip()
             if not script:
                 raise ValueError("usage: browser eval <javascript>")
-            result = _browser.page.evaluate(script)
-            return str(result) if result is not None else "OK"
+            return _bb("eval", script, timeout=timeout)
 
-        if action == "close":
-            _browser.close()
-            return "Browser closed."
+        if action == "fetch" and not rest:
+            url = stdin.strip()
+            if not url:
+                raise ValueError("usage: browser fetch <url> [options]")
+            return _bb("fetch", url, timeout=timeout)
 
-        raise ValueError(
-            f"unknown browser action: '{action}'\n"
-            "Use: open|snapshot|screenshot|click|fill|type|press|scroll|eval|get|back|forward|refresh|close"
-        )
+        if action == "tabs":
+            return _bb("tab", *rest, timeout=timeout)
+
+        if action == "tab-new":
+            if rest:
+                return _bb("tab", "new", _normalize_url(rest[0]), *rest[1:], timeout=timeout)
+            return _bb("tab", "new", timeout=timeout)
+
+        if action == "tab-close":
+            return _bb("tab", "close", *rest, timeout=timeout)
+
+        return _bb(action, *rest, timeout=timeout)

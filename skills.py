@@ -17,6 +17,7 @@ and can even create new ones via `skill create`.
 """
 
 import re
+import shutil
 from pathlib import Path
 
 
@@ -26,8 +27,29 @@ def _skills_dir(data_dir: str) -> Path:
     return Path(data_dir) / "skills"
 
 
+def _seed_skills_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "seed" / "skills"
+
+
 def _skill_path(data_dir: str, name: str) -> Path:
     return _skills_dir(data_dir) / f"{name}.md"
+
+
+def _ensure_seed_skills(data_dir: str):
+    """
+    Mirror bundled seed skills into the runtime data directory without
+    overwriting user-edited skill files.
+    """
+    dst_dir = _skills_dir(data_dir)
+    seed_dir = _seed_skills_dir()
+    if not seed_dir.exists():
+        return
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for src in sorted(seed_dir.glob("*.md")):
+        dst = dst_dir / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
 
 
 def _parse_skill(raw: str) -> tuple[str, str]:
@@ -51,6 +73,7 @@ def _write_skill(path: Path, description: str, content: str):
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def list_skills(data_dir: str) -> list[dict]:
+    _ensure_seed_skills(data_dir)
     d = _skills_dir(data_dir)
     if not d.exists():
         return []
@@ -62,6 +85,7 @@ def list_skills(data_dir: str) -> list[dict]:
 
 def load_skill(data_dir: str, name: str) -> tuple[str, str]:
     """Returns (description, body). Raises FileNotFoundError if not found."""
+    _ensure_seed_skills(data_dir)
     p = _skill_path(data_dir, name)
     if not p.exists():
         raise FileNotFoundError(f"skill '{name}' not found")
@@ -69,6 +93,7 @@ def load_skill(data_dir: str, name: str) -> tuple[str, str]:
 
 
 def create_skill(data_dir: str, name: str, description: str, content: str):
+    _ensure_seed_skills(data_dir)
     p = _skill_path(data_dir, name)
     if p.exists():
         raise FileExistsError(f"skill '{name}' already exists — use `skill update` to modify")
@@ -76,6 +101,7 @@ def create_skill(data_dir: str, name: str, description: str, content: str):
 
 
 def update_skill(data_dir: str, name: str, description: str | None, content: str | None):
+    _ensure_seed_skills(data_dir)
     p = _skill_path(data_dir, name)
     if not p.exists():
         raise FileNotFoundError(f"skill '{name}' not found")
@@ -84,6 +110,7 @@ def update_skill(data_dir: str, name: str, description: str | None, content: str
 
 
 def delete_skill(data_dir: str, name: str):
+    _ensure_seed_skills(data_dir)
     p = _skill_path(data_dir, name)
     if not p.exists():
         raise FileNotFoundError(f"skill '{name}' not found")

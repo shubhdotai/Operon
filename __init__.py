@@ -1,7 +1,7 @@
 """
-agent — A minimal agentic loop you import and use.
+Operon — A minimal agentic loop you import and use.
 
-    from agent import Agent
+    from Operon import Agent
 
     agent = Agent(api_key="sk-...", model="gpt-4.1-mini")
     print(agent.chat("what files do I have?"))
@@ -23,11 +23,11 @@ from typing import Callable, Iterator
 
 import openai
 
-import agent.db as db_mod
-import agent.memory as mem
-from agent.context import build_context
-from agent.loop import run_loop
-from agent.tools import Registry, register_builtins
+import Operon.db as db_mod
+import Operon.memory as mem
+from Operon.context import build_context
+from Operon.loop import run_loop
+from Operon.tools import Registry, register_builtins
 
 
 class Agent:

@@ -25,24 +25,26 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE TABLE IF NOT EXISTS messages (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic_id    TEXT NOT NULL,
-    run_id      TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    content     TEXT,
-    tool_calls  TEXT,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id     TEXT NOT NULL,
+    run_id       TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    content      TEXT,
+    tool_calls   TEXT,
     tool_call_id TEXT,
-    created_at  INTEGER NOT NULL
+    reasoning    TEXT,
+    created_at   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS summaries (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic_id     TEXT NOT NULL,
-    run_id       TEXT,
-    summary      TEXT NOT NULL,
-    user_message TEXT,
-    embedding    TEXT,
-    created_at   INTEGER NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id        TEXT NOT NULL,
+    run_id          TEXT,
+    summary         TEXT NOT NULL,
+    user_message    TEXT,
+    embedding       TEXT,
+    embedding_model TEXT,
+    created_at      INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS facts (
@@ -53,8 +55,36 @@ CREATE TABLE IF NOT EXISTS facts (
 );
 """
 
+# Migrations applied to existing databases (safe to re-run — errors on duplicate columns are swallowed)
+_MIGRATIONS = [
+    "ALTER TABLE messages ADD COLUMN reasoning TEXT",
+    "ALTER TABLE summaries ADD COLUMN embedding_model TEXT",
+]
+
+# FTS5 virtual table + trigger for keyword search over summaries
+_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(
+    summary, user_message,
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS summaries_fts_ai
+AFTER INSERT ON summaries BEGIN
+    INSERT INTO summaries_fts(rowid, summary, user_message)
+    VALUES (new.id, new.summary, COALESCE(new.user_message, ''));
+END;
+"""
+
+_has_fts: bool = False
+
+
+def has_fts() -> bool:
+    """Return True if the summaries_fts FTS5 table is available."""
+    return _has_fts
+
 
 def open_db(data_dir: str) -> sqlite3.Connection:
+    global _has_fts
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(
         str(Path(data_dir) / "agent.db"),
@@ -64,6 +94,34 @@ def open_db(data_dir: str) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
     db.commit()
+
+    # Apply column-level migrations for existing databases
+    for statement in _MIGRATIONS:
+        try:
+            db.execute(statement)
+            db.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+
+    # Set up FTS5 keyword search (requires SQLite built with FTS5 support)
+    try:
+        db.executescript(_FTS_SCHEMA)
+        db.commit()
+        # Populate FTS for any summaries inserted before FTS was set up
+        fts_count = db.execute("SELECT COUNT(*) FROM summaries_fts").fetchone()[0]
+        summary_count = db.execute("SELECT COUNT(*) FROM summaries").fetchone()[0]
+        if fts_count != summary_count:
+            db.execute("DELETE FROM summaries_fts")
+            db.execute(
+                "INSERT INTO summaries_fts(rowid, summary, user_message) "
+                "SELECT id, summary, COALESCE(user_message, '') FROM summaries"
+            )
+            db.commit()
+        _has_fts = True
+    except sqlite3.OperationalError:
+        _has_fts = False  # FTS5 not available — keyword search falls back to LIKE
+
     return db
 
 
@@ -111,19 +169,20 @@ def save_messages(db: sqlite3.Connection, topic_id: str, run_id: str, messages: 
 
         tool_calls = json.dumps(msg["tool_calls"]) if msg.get("tool_calls") else None
         tool_call_id = msg.get("tool_call_id")
+        reasoning = msg.get("reasoning")
 
         db.execute(
             "INSERT INTO messages "
-            "(topic_id, run_id, role, content, tool_calls, tool_call_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (topic_id, run_id, msg["role"], content, tool_calls, tool_call_id, now),
+            "(topic_id, run_id, role, content, tool_calls, tool_call_id, reasoning, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (topic_id, run_id, msg["role"], content, tool_calls, tool_call_id, reasoning, now),
         )
     db.commit()
 
 
 def load_messages_by_run(db: sqlite3.Connection, run_id: str) -> list:
     rows = db.execute(
-        "SELECT role, content, tool_calls, tool_call_id "
+        "SELECT role, content, tool_calls, tool_call_id, reasoning "
         "FROM messages WHERE run_id = ? ORDER BY id ASC",
         (run_id,),
     ).fetchall()
@@ -177,4 +236,12 @@ def _row_to_message(row: sqlite3.Row) -> dict:
 
     if row["tool_call_id"]:
         msg["tool_call_id"] = row["tool_call_id"]
+
+    # reasoning is only present in load_messages_by_run rows
+    try:
+        if row["reasoning"]:
+            msg["reasoning"] = row["reasoning"]
+    except IndexError:
+        pass
+
     return msg

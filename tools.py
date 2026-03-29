@@ -378,7 +378,7 @@ def register_builtins(registry: Registry, db: sqlite3.Connection, client, embedd
 
     # ── Memory ────────────────────────────────────────────────────────────────
 
-    import agent.memory as mem
+    import Operon.memory as mem
 
     @registry.command(
         "memory",
@@ -436,7 +436,7 @@ def register_builtins(registry: Registry, db: sqlite3.Connection, client, embedd
 
     # ── Topics ────────────────────────────────────────────────────────────────
 
-    import agent.db as db_mod
+    import Operon.db as db_mod
 
     @registry.command(
         "topic",
@@ -477,8 +477,8 @@ def register_builtins(registry: Registry, db: sqlite3.Connection, client, embedd
 
     # ── Skills + Browser ──────────────────────────────────────────────────────
 
-    from agent.skills import register_skill_commands
-    from agent.browser import register_browser_commands
+    from Operon.skills import register_skill_commands
+    from Operon.browser import register_browser_commands
 
     register_skill_commands(registry)
     register_browser_commands(registry)
